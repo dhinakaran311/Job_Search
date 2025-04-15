@@ -105,3 +105,5 @@ Job_Search/
 ├── .gitignore
 └── README.md                     # Main project README
 ```
+
+<!-- Updated: 2025-04-15 16:52:44 -->
