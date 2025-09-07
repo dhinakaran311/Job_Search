@@ -1,0 +1,74 @@
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+
+# --- Virtual Environment ---
+.venv/
+env/
+venv/
+ENV/
+
+# --- Environment Files ---
+.env
+.env.*
+
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS Files ---
+.DS_Store
+Thumbs.db
+
+# --- Test / Pytest ---
+.pytest_cache/
+.cache/
+coverage.xml
+htmlcov/
+*.cover
+test_embedding_download.*
+
+# --- Environment / Config ---
+.env
+.env.*
+*.ini
+*.cfg
+*.toml
+
+# --- Database / Cache Files ---
+*.sqlite3
+*.db
+chroma_db/
+data/*.json
+!data/sample_jobs.json   # keep sample_jobs.json (example data)
+!data/adzuna_cache.json  # keep cached example if needed
+
+# --- Logs / Temp ---
+*.log
+logs/
+*.tmp
+*.bak
+
+
+# --- Project Specific ---
+backend/ingestion/parsed_resumes.txt
+data/resumes/
+scripts/__pycache__/
+backend/db/__pycache__/
+backend/ingestion/__pycache__/
+backend/services/__pycache__/
+backend/utils/__pycache__/
+app_streamlit/__pycache__/
+tests/

@@ -1,0 +1,28 @@
+# Core project dependencies
+streamlit==1.37.0
+chromadb==0.5.3
+chroma-hnswlib==0.7.3
+sentence-transformers==2.7.0
+scikit-learn
+ollama-0.5.3
+# Resume parsing
+pdfplumber==0.11.0
+python-docx==1.1.2
+filetype==1.2.0   # instead of python-magic (Windows-safe)
+
+# Environment + API clients
+openai==1.106.0
+python-dotenv==1.0.1
+requests==2.32.3
+# Testing
+pytest==8.3.2
+pytest-mock==3.10.0
+
+import ollama
+
+def extract_skills_ollama(text):
+    response = ollama.chat(model='mistral', messages=[
+        {'role': 'user', 'content': f'Extract technical skills from this text as a Python list: {text}'}
+    ])
+    # Parse response to get the list
+    return response['message']['content']
