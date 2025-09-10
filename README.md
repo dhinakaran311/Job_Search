@@ -79,7 +79,6 @@ Job_Search/
 
 Create a `.env` file in your root directory for sensitive keys:
 ```
-OPENAI_API_KEY=your_openai_key
 ADZUNA_APP_ID=your_adzuna_app_id
 ADZUNA_APP_KEY=your_adzuna_app_key
 ```
@@ -102,11 +101,6 @@ Pull requests and issues are welcome! For major changes, please open an issue fi
 
 ---
 
-## License
-
-[MIT](LICENSE)
-
----
 
 ## Acknowledgements
 
@@ -114,3 +108,4 @@ Pull requests and issues are welcome! For major changes, please open an issue fi
 - [Adzuna API](https://developer.adzuna.com/)
 - [OpenAI](https://openai.com/)
 - [Ollama](https://ollama.com/)
+
