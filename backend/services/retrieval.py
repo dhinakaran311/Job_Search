@@ -7,13 +7,17 @@ Provides:
 - small CLI for quick manual tests when run as module.
 """
 
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 import re
 import os
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
+from scipy.sparse import issparse
 
 from backend.services import embedding as emb_service
 from backend.db import chroma as chroma_helper
 from backend.services.ranking import fused_score, bucket_for_score
+from backend.services.skill_extractor import extract_skills as extract_skills_service
 
 # small fallback lexicon (keeps consistent with previous modules)
 DEFAULT_LEXICON = [
@@ -178,6 +182,120 @@ def recommend_jobs(
     # sort by score desc
     results = sorted(results, key=lambda x: x["score"], reverse=True)
     return results
+
+
+class TFIDFRecommender:
+    """
+    TF-IDF based job recommender that finds similar jobs based on text content.
+    """
+    def __init__(self):
+        self.vectorizer = TfidfVectorizer(stop_words='english')
+        self.job_vectors = None
+        self.jobs = []
+        self.job_skills = {}
+    
+    def fit(self, jobs: List[Dict[str, Any]]) -> None:
+        """
+        Fit the TF-IDF vectorizer on job descriptions.
+        
+        Args:
+            jobs: List of job dictionaries with 'description' and 'id' fields
+        """
+        self.jobs = jobs
+        descriptions = [j.get("description", "") or j.get("title", "") for j in jobs]
+        self.job_vectors = self.vectorizer.fit_transform(descriptions)
+        
+        # Precompute skills for each job
+        self.job_skills = {}
+        for job in jobs:
+            self.job_skills[job["id"]] = extract_skills_service(
+                job.get("description", "") or job.get("title", ""), 
+                use_llm=False
+            )
+    
+    def recommend(
+        self, 
+        query_text: str, 
+        top_k: int = 10, 
+        use_llm: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Find similar jobs based on text similarity and skill overlap.
+        
+        Args:
+            query_text: Text to find similar jobs for (e.g., resume text)
+            top_k: Number of results to return
+            use_llm: Whether to use LLM for skill extraction
+            
+        Returns:
+            List of result dictionaries with job info and match scores
+        """
+        if not self.jobs or self.job_vectors is None:
+            return []
+            
+        # Transform query to TF-IDF vector
+        query_vector = self.vectorizer.transform([query_text])
+        
+        # Calculate cosine similarities
+        similarities = linear_kernel(query_vector, self.job_vectors).flatten()
+        
+        # Extract skills from query text
+        query_skills = extract_skills_service(query_text, use_llm=use_llm)
+        
+        results = []
+        for idx, job in enumerate(self.jobs):
+            job_skills = self.job_skills.get(job["id"], [])
+            
+            # Calculate skill overlap
+            overlap = set(job_skills) & set(query_skills)
+            missing_skills = list(set(job_skills) - set(query_skills))
+            
+            # Calculate overlap ratio (handle division by zero)
+            overlap_ratio = len(overlap) / len(job_skills) if job_skills else 0
+            
+            # Combined score (70% similarity, 30% skill overlap)
+            score = 0.7 * similarities[idx] + 0.3 * overlap_ratio
+            
+            results.append({
+                "job": job,
+                "similarity": float(similarities[idx]),
+                "job_skills": job_skills,
+                "resume_skills": query_skills,
+                "overlap": list(overlap),
+                "missing_skills": missing_skills,
+                "score": float(score)
+            })
+        
+        # Sort by score in descending order
+        return sorted(results, key=lambda x: x["score"], reverse=True)[:top_k]
+
+
+def bucketize_recommendations(results: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Categorize recommendations into buckets based on score thresholds.
+    
+    Args:
+        results: List of recommendation results with 'score' field
+        
+    Returns:
+        Dictionary with keys 'Safe', 'Stretch', 'Fallback' containing matching results
+    """
+    buckets = {
+        "Safe": [],
+        "Stretch": [],
+        "Fallback": []
+    }
+    
+    for result in results:
+        score = result.get("score", 0)
+        if score >= 0.65:
+            buckets["Safe"].append(result)
+        elif score >= 0.4:
+            buckets["Stretch"].append(result)
+        else:
+            buckets["Fallback"].append(result)
+            
+    return buckets
 
 
 # Simple CLI for manual testing

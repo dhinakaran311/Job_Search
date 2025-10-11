@@ -1,12 +1,24 @@
 import os
 import io
 import re
+import time
+import hashlib
 import unicodedata
-from typing import Union
+from typing import Union, Optional, Dict, Any
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pdfplumber
 import docx
-import filetype  # safer than python-magic on Windows
+import filetype
+from tqdm import tqdm  # For progress tracking
+
+# Cache for parsed resumes to avoid re-processing
+PARSED_RESUME_CACHE: Dict[str, str] = {}
+CACHE_EXPIRY = 3600  # 1 hour cache expiry
+
+# Thread pool for parallel processing
+THREAD_POOL = ThreadPoolExecutor(max_workers=4)
 
 
 def _clean_text(text: str) -> str:
@@ -20,20 +32,47 @@ def _clean_text(text: str) -> str:
 
 
 def _extract_pdf(file: Union[str, bytes]) -> str:
+    """Extract text from PDF with optimizations."""
+    cache_key = None
+    if isinstance(file, str):
+        cache_key = f"file:{os.path.abspath(file)}"
+        # Check cache first
+        if cache_key in PARSED_RESUME_CACHE:
+            return PARSED_RESUME_CACHE[cache_key]
+    
     try:
+        start_time = time.time()
+        
+        # Optimized PDF extraction with page-level parallelization
+        def process_page(page):
+            try:
+                return page.extract_text() or ""
+            except Exception:
+                return ""
+        
         if isinstance(file, str):
             with pdfplumber.open(file) as pdf:
-                pages = [page.extract_text() or "" for page in pdf.pages]
+                with ThreadPoolExecutor() as executor:
+                    pages = list(executor.map(process_page, pdf.pages))
         else:
             with pdfplumber.open(io.BytesIO(file)) as pdf:
-                pages = [page.extract_text() or "" for page in pdf.pages]
-
+                with ThreadPoolExecutor() as executor:
+                    pages = list(executor.map(process_page, pdf.pages))
+        
         text = "\n".join(pages)
         if not text.strip():
             return "No selectable text — OCR not supported in demo"
-        return _clean_text(text)
+            
+        result = _clean_text(text)
+        
+        # Cache the result
+        if cache_key:
+            PARSED_RESUME_CACHE[cache_key] = result
+            
+        return result
+        
     except Exception as e:
-        return f"Error parsing PDF: {e}"
+        return f"Error parsing PDF: {str(e)[:200]}"  # Truncate long error messages
 
 
 def _extract_docx(file: Union[str, bytes]) -> str:
@@ -61,7 +100,7 @@ def _extract_txt(file: Union[str, bytes]) -> str:
         return f"Error parsing TXT: {e}"
 
 
-def extract_text_from_file(file: Union[str, bytes]) -> str:
+def extract_text_from_file(file: Union[str, bytes], use_cache: bool = True) -> str:
     """
     Extract plain text from a resume file (PDF, DOCX, TXT, MD).
     Returns cleaned plain text.
@@ -73,7 +112,34 @@ def extract_text_from_file(file: Union[str, bytes]) -> str:
         elif ext == ".docx":
             return _extract_docx(file)
         elif ext in [".txt", ".md"]:
-            return _extract_txt(file)
+            # Generate cache key for bytes input
+            cache_key = None
+            if use_cache and isinstance(file, str) and os.path.isfile(file):
+                file_stat = os.stat(file)
+                cache_key = f"{file}:{file_stat.st_mtime}"
+                if cache_key in PARSED_RESUME_CACHE:
+                    return PARSED_RESUME_CACHE[cache_key]
+                with open(file, 'rb') as f:
+                    file_bytes = f.read()
+            else:
+                file_bytes = file if isinstance(file, bytes) else file.read()
+                if use_cache:
+                    cache_key = f"bytes:{hashlib.md5(file_bytes).hexdigest()}"
+                    if cache_key in PARSED_RESUME_CACHE:
+                        return PARSED_RESUME_CACHE[cache_key]
+
+            # Detect file type
+            kind = filetype.guess(file_bytes)
+
+            mime = kind.mime if kind else None
+            if mime and "pdf" in mime:
+                return _extract_pdf(file)
+            elif mime and ("word" in mime or "officedocument" in mime):
+                return _extract_docx(file)
+            elif mime and "text" in mime:
+                return _extract_txt(file)
+            else:
+                return "Unsupported file type"
         else:
             with open(file, "rb") as f:
                 header = f.read(261)

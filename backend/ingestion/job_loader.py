@@ -33,8 +33,14 @@ def _make_id(raw: Dict[str, Any]) -> str:
         return str(raw["job_id"])
     if raw.get("url"):
         return hashlib.sha1(raw.get("url", "").encode("utf-8")).hexdigest()
+    
+    # Handle company field which might be a dictionary
+    company = raw.get("company", "")
+    if isinstance(company, dict):
+        company = company.get("display_name") or company.get("name") or ""
+    
     # fallback to title+company
-    key = (raw.get("title", "") + "|" + str(raw.get("company", ""))).strip()
+    key = f"{raw.get('title', '')}|{company}".strip()
     return hashlib.sha1(key.encode("utf-8")).hexdigest()
 
 def _extract_skills_from_text(text: str) -> List[str]:

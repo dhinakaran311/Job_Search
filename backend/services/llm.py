@@ -113,26 +113,59 @@ def _call_llm(prompt: str, json_mode: bool = False) -> str:
 
 
 def extract_skills_llm(text: str) -> List[str]:
-    """Extract skills from text using Ollama LLM, returns a list of strings."""
+    """
+    Extract skills from text using Ollama LLM, returns a list of strings.
+    Uses safe parsing methods (json.loads and ast.literal_eval) instead of eval().
+    """
+    import ast
+    
     prompt = (
         "Extract the technical skills from the following text. "
-        "Return the skills as a Python list of strings. Example: ['python', 'react', 'sql']. "
+        "Return the skills as a JSON list of strings. Example: [\"python\", \"react\", \"sql\"]. "
         "If no skills are found, return an empty list. Text: \n"
         f'"""{text}"""'
     )
-    response_text = _call_llm(prompt)
-    # Try to parse the response as a Python list
+    
+    response_text = _call_llm(prompt).strip()
+    
+    # Try JSON parsing first (safest option)
     try:
-        # Remove code block markers if present
-        response_text = response_text.strip()
-        if response_text.startswith("[") and response_text.endswith("]"):
-            return [str(skill).lower().strip("'\" ") for skill in json.loads(response_text.replace("'", '"'))]
-        # Fallback: try eval (unsafe, but Ollama is local)
-        skills = eval(response_text, {"__builtins__": {}})
-        if isinstance(skills, list):
-            return [str(skill).lower() for skill in skills]
-    except Exception:
-        pass
+        # Clean up common formatting issues
+        clean_text = response_text.strip()
+        if clean_text.startswith('```'):
+            clean_text = clean_text[3:]
+        if clean_text.endswith('```'):
+            clean_text = clean_text[:-3]
+        clean_text = clean_text.strip()
+        
+        # First try: parse as JSON
+        try:
+            skills = json.loads(clean_text)
+            if isinstance(skills, list):
+                return [str(skill).lower().strip() for skill in skills]
+        except json.JSONDecodeError:
+            # If JSON parsing fails, try with single quotes replaced by double quotes
+            try:
+                skills = json.loads(clean_text.replace("'", '"'))
+                if isinstance(skills, list):
+                    return [str(skill).lower().strip() for skill in skills]
+            except json.JSONDecodeError:
+                pass
+        
+        # Second try: use ast.literal_eval (safer than eval)
+        try:
+            skills = ast.literal_eval(clean_text)
+            if isinstance(skills, list):
+                return [str(skill).lower().strip() for skill in skills]
+        except (ValueError, SyntaxError, TypeError):
+            pass
+            
+    except Exception as e:
+        # Log the error if needed
+        print(f"Error parsing skills: {e}")
+    
+    # If all parsing attempts fail, return an empty list
+    return []
     return []
 
 

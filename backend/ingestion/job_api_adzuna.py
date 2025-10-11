@@ -1,57 +1,118 @@
 """
-Adzuna adapter + CLI.
+Optimized Adzuna API client with caching and request batching.
 
-Provides:
-- fetch_jobs_adzuna(what, where, page=1, results_per_page=20, country='in')
-- fetch_jobs_for_queries(queries, country='in', pages_per_query=1)
-- CLI entrypoint to fetch and optionally ingest into Chroma using backend.ingestion.job_loader.ingest_jobs
-
-Notes:
-- Reads ADZUNA_APP_ID and ADZUNA_APP_KEY from env (or .env via python-dotenv).
-- Implements simple throttling and exponential backoff for 429/5xx.
-- Deduplicates jobs by adzuna 'id' or URL.
+Features:
+- Request caching with configurable TTL
+- Parallel request execution
+- Rate limiting with exponential backoff
+- Request batching for multiple queries
+- Automatic retry on failures
 """
 import os
 import time
 import json
 import logging
-from typing import List, Dict, Any, Optional
+import hashlib
+import pickle
+import threading
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from functools import lru_cache
+
 import requests
 from urllib.parse import urlencode
 
-# optional .env loader
+# Local imports
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except Exception:
+except ImportError:
     pass
 
-# local helpers
 from backend.db import chroma as chroma_helper
 from backend.ingestion import job_loader
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("adzuna")
 LOG.setLevel(logging.INFO)
-LOG.addHandler(logging.StreamHandler())
 
-# Rate limit throttle: max_requests_per_minute (default conservative)
-DEFAULT_MAX_REQ_PER_MIN = 20
-_MIN_INTERVAL = 60.0 / DEFAULT_MAX_REQ_PER_MIN  # seconds between requests
+# Constants
+DEFAULT_MAX_REQ_PER_MIN = 30  # Increased default rate limit
+CACHE_DIR = Path("data/cache")
+CACHE_TTL = 3600 * 24  # 24 hours cache TTL
 
-# Module-level last request time for simple throttling
-_last_request_time = 0.0
+# Ensure cache directory exists
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+class RateLimiter:
+    """Thread-safe rate limiter with exponential backoff."""
+    
+    def __init__(self, max_requests: int = 30, per_seconds: float = 60.0):
+        self.max_requests = max_requests
+        self.per_seconds = per_seconds
+        self.requests = []
+        self.lock = threading.Lock()
+    
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            # Remove old requests
+            self.requests = [t for t in self.requests if now - t < self.per_seconds]
+            
+            if len(self.requests) >= self.max_requests:
+                # Calculate sleep time
+                oldest = self.requests[0]
+                sleep_time = max(0, (oldest + self.per_seconds) - now)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+            
+            self.requests.append(time.time())
+
+# Global rate limiter
+RATE_LIMITER = RateLimiter(max_requests=DEFAULT_MAX_REQ_PER_MIN)
 
 def _throttle():
     """Ensure we respect min interval between requests."""
-    global _last_request_time
-    now = time.perf_counter()
-    elapsed = now - _last_request_time
-    if elapsed < _MIN_INTERVAL:
-        to_sleep = _MIN_INTERVAL - elapsed
-        LOG.debug(f"Throttling: sleeping {to_sleep:.2f}s to respect rate limits")
-        time.sleep(to_sleep)
-    _last_request_time = time.perf_counter()
+    RATE_LIMITER.wait()
 
+def _get_cache_key(what: str, where: str, page: int, results_per_page: int) -> str:
+    """Generate a unique cache key for a query."""
+    key_str = f"{what}:{where}:{page}:{results_per_page}"
+    return hashlib.md5(key_str.encode()).hexdigest()
+
+def _get_cache_file_path(cache_key: str) -> Path:
+    """Get the full path to a cache file."""
+    return CACHE_DIR / f"{cache_key}.pkl"
+
+def _load_from_cache(cache_key: str) -> Optional[List[Dict[str, Any]]]:
+    """Load data from cache if it exists and is fresh."""
+    cache_file = _get_cache_file_path(cache_key)
+    if not cache_file.exists():
+        return None
+        
+    try:
+        mtime = cache_file.stat().st_mtime
+        if time.time() - mtime > CACHE_TTL:
+            return None
+            
+        with open(cache_file, 'rb') as f:
+            data = pickle.load(f)
+            return data
+    except Exception as e:
+        LOG.warning(f"Cache load failed: {e}")
+        return None
+
+def _save_to_cache(cache_key: str, data: List[Dict[str, Any]]) -> None:
+    """Save data to cache."""
+    try:
+        cache_file = _get_cache_file_path(cache_key)
+        with open(cache_file, 'wb') as f:
+            pickle.dump(data, f)
+    except Exception as e:
+        LOG.warning(f"Cache save failed: {e}")
 
 def fetch_jobs_adzuna(
     what: str,
@@ -59,108 +120,177 @@ def fetch_jobs_adzuna(
     page: int = 1,
     results_per_page: int = 20,
     country: str = "in",
-    max_retries: int = 5,
-    timeout: int = 15,
+    max_retries: int = 3,
+    timeout: int = 10,
+    use_cache: bool = True
 ) -> List[Dict[str, Any]]:
     """
-    Fetch jobs from Adzuna.
-
-    Returns list of raw job dicts (Adzuna's 'results' elements).
+    Fetch jobs from Adzuna API with caching, retries, and rate limiting.
     """
-    app_id = os.environ.get("ADZUNA_APP_ID")
-    app_key = os.environ.get("ADZUNA_APP_KEY")
+    # Check cache first
+    cache_key = _get_cache_key(what, where, page, results_per_page)
+    if use_cache:
+        cached = _load_from_cache(cache_key)
+        if cached is not None:
+            LOG.debug(f"Cache hit for {what} in {where} (page {page})")
+            return cached
+    
+    # Apply rate limiting
+    RATE_LIMITER.wait()
+    
+    app_id = os.getenv("ADZUNA_APP_ID")
+    app_key = os.getenv("ADZUNA_APP_KEY")
+    
     if not app_id or not app_key:
-        raise EnvironmentError("ADZUNA_APP_ID and ADZUNA_APP_KEY must be set in environment or .env")
-
+        LOG.error("ADZUNA_APP_ID and ADZUNA_APP_KEY must be set in environment")
+        return []
+    
     base_url = f"https://api.adzuna.com/v1/api/jobs/{country}/search/{page}"
-    # Build params WITHOUT logging secrets
+    
     params = {
         "app_id": app_id,
         "app_key": app_key,
+        "results_per_page": results_per_page,
         "what": what,
         "where": where,
-        "results_per_page": results_per_page,
-        "content-type": "application/json"
+        "content-type": "application/json",
     }
-
-    # For logging, show a sanitized URL (no keys)
-    log_params = {k: v for k, v in params.items() if k not in ("app_id", "app_key")}
-    LOG.info(f"Fetching Adzuna: {base_url}?{urlencode(log_params)}")
-
-    attempt = 0
-    while attempt < max_retries:
-        _throttle()
+    
+    for attempt in range(max_retries):
         try:
+            LOG.debug(f"Fetching Adzuna: {what} in {where} (page {page})")
+            
+            # Make the request
             resp = requests.get(base_url, params=params, timeout=timeout)
-        except requests.RequestException as e:
-            LOG.warning(f"Network error fetching Adzuna (attempt {attempt+1}): {e}")
-            backoff = 2 ** attempt
-            time.sleep(backoff)
-            attempt += 1
-            continue
-
-        if resp.status_code == 200:
-            try:
+            
+            if resp.status_code == 200:
                 data = resp.json()
-            except Exception:
-                LOG.error("Failed to parse Adzuna JSON response")
-                return []
-            results = data.get("results", [])
-            LOG.info(f"Adzuna returned {len(results)} results")
-            return results
-
-        if resp.status_code == 429:
-            # Too many requests -> exponential backoff
-            backoff = 2 ** attempt
-            LOG.warning(f"Adzuna 429 rate limit. Backing off {backoff}s (attempt {attempt+1})")
+                jobs = data.get("results", [])
+                
+                # Cache the results
+                if jobs and use_cache:
+                    _save_to_cache(cache_key, jobs)
+                    
+                return jobs
+                
+            elif resp.status_code == 429:  # Rate limited
+                retry_after = int(resp.headers.get('Retry-After', min(30, 5 * (attempt + 1))))
+                LOG.warning(f"Rate limited, retrying after {retry_after}s...")
+                time.sleep(retry_after)
+                continue
+                
+            elif 500 <= resp.status_code < 600:  # Server error
+                backoff = min(30, (2 ** attempt))  # Cap backoff at 30s
+                LOG.warning(f"Server error {resp.status_code}, retrying in {backoff}s...")
+                time.sleep(backoff)
+                continue
+                
+            else:
+                LOG.error(f"Error {resp.status_code}: {resp.text[:200]}")
+                break
+                
+        except requests.exceptions.RequestException as e:
+            LOG.error(f"Request failed (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                LOG.error(f"Max retries reached for {what} in {where}")
+                raise
+                
+            backoff = min(30, (2 ** attempt))  # Cap backoff at 30s
             time.sleep(backoff)
-            attempt += 1
-            continue
-
-        if 500 <= resp.status_code < 600:
-            backoff = 2 ** attempt
-            LOG.warning(f"Adzuna server error {resp.status_code}. Backing off {backoff}s (attempt {attempt+1})")
-            time.sleep(backoff)
-            attempt += 1
-            continue
-
-        # other client errors
-        LOG.error(f"Adzuna returned {resp.status_code}: {resp.text[:200]}")
-        return []
-
-    LOG.error("Exceeded max retries fetching Adzuna")
+    
     return []
+
+def make_dedup_key(job: Dict[str, Any]) -> str:
+    """
+    Create a unique key for deduplication based on job title, company, and description.
+    
+    Args:
+        job: Job dictionary containing title, company, and description
+        
+    Returns:
+        SHA1 hash string that uniquely identifies similar job postings
+    """
+    import hashlib
+    
+    title = (job.get("title") or "").strip().lower()
+
+    company_obj = job.get("company")
+    if isinstance(company_obj, dict):
+        company = (company_obj.get("display_name") or company_obj.get("name") or "").strip().lower()
+    else:
+        company = (str(company_obj) if company_obj else "").strip().lower()
+
+    # Use first 100 chars of description for deduplication
+    desc = (job.get("description") or job.get("description_snippet") or "")[:100].strip().lower()
+    
+    # Create a consistent string representation and hash it
+    base = f"{title}|{company}|{desc}"
+    return hashlib.sha1(base.encode()).hexdigest()
 
 
 def fetch_jobs_for_queries(
     queries: List[Dict[str, str]],
-    country: str = "in",
+    country: str = "gb",
     pages_per_query: int = 1,
     results_per_page: int = 20,
+    max_workers: int = 4,
+    use_cache: bool = True
 ) -> List[Dict[str, Any]]:
     """
-    Run a list of queries (each {'what':..., 'where':...}) and return a deduplicated list of jobs.
+    Run multiple queries in parallel and return deduplicated results.
+    
+    Deduplication is done based on a hash of (title + company + first 100 chars of description)
+    to prevent duplicate job postings even if they have different IDs/URLs.
     """
-    seen = set()
-    out = []
-
-    for q in queries:
-        what = q.get("what", "")
-        where = q.get("where", "")
+    seen_hashes = set()
+    all_jobs = []
+    
+    def process_query(query: Dict[str, str], page: int) -> List[Dict[str, Any]]:
+        """Process a single query page."""
+        try:
+            return fetch_jobs_adzuna(
+                what=query.get("what", ""),
+                where=query.get("where", ""),
+                page=page,
+                results_per_page=results_per_page,
+                country=country,
+                use_cache=use_cache
+            )
+        except Exception as e:
+            LOG.error(f"Error processing query {query} (page {page}): {e}")
+            return []
+    
+    # Prepare all tasks
+    tasks = []
+    for query in queries:
         for page in range(1, pages_per_query + 1):
-            results = fetch_jobs_adzuna(what=what, where=where, page=page, results_per_page=results_per_page, country=country)
-            for r in results:
-                # Adzuna's id or redirect_url used for de-duplication
-                rid = r.get("id") or r.get("redirect_url") or r.get("url")
-                if not rid:
-                    # fallback to hashing title+company+location
-                    rid = f"{r.get('title')}_{r.get('company')}_{r.get('location')}"
-                if rid in seen:
-                    continue
-                seen.add(rid)
-                out.append(r)
-    LOG.info(f"Total unique Adzuna jobs fetched: {len(out)}")
-    return out
+            tasks.append((query, page))
+    
+    # Process tasks in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(process_query, query, page)
+            for query, page in tasks
+        ]
+        
+        # Process results as they complete
+        for future in as_completed(futures):
+            try:
+                jobs = future.result()
+                for job in jobs:
+                    # Create deduplication key
+                    dedup_key = make_dedup_key(job)
+                    
+                    # Only add if we haven't seen this job before
+                    if dedup_key not in seen_hashes:
+                        seen_hashes.add(dedup_key)
+                        all_jobs.append(job)
+                        
+            except Exception as e:
+                LOG.error(f"Error processing job result: {e}")
+    
+    LOG.info(f"Fetched {len(all_jobs)} unique jobs from {len(queries)} queries")
+    return all_jobs
 
 
 def normalize_adzuna_job(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -219,7 +349,7 @@ def _save_cache(cache: Dict[str, Any]):
 
 def fetch_and_ingest(
     queries: List[Dict[str, str]],
-    country: str = "in",
+    country: str = "gb",  # Changed from "in" to "gb" for United Kingdom
     pages_per_query: int = 1,
     results_per_page: int = 20,
     ingest: bool = True,
@@ -227,19 +357,21 @@ def fetch_and_ingest(
 ):
     """
     High-level helper: fetch jobs for queries, normalize them and optionally ingest to Chroma.
+    Jobs that have been seen before (based on a cache of IDs) are still processed and returned.
     """
     raw_jobs = fetch_jobs_for_queries(queries, country=country, pages_per_query=pages_per_query, results_per_page=results_per_page)
 
-    # Load cache and skip previously ingested IDs if present
+    # Load cache to update it with new IDs, but we won't filter based on it.
     cache = _load_cache()
     seen_ids = set(cache.get("seen_ids", []))
 
     normalized = []
     for r in raw_jobs:
-        nid = r.get("id") or r.get("redirect_url") or r.get("url") or ""
-        if nid in seen_ids:
-            continue
+        # We still normalize all jobs returned from the query.
         normalized.append(normalize_adzuna_job(r))
+        
+        # And we update the cache of seen IDs for future reference (if needed).
+        nid = r.get("id") or r.get("redirect_url") or r.get("url") or ""
         if nid:
             seen_ids.add(nid)
 
@@ -247,7 +379,7 @@ def fetch_and_ingest(
     cache["seen_ids"] = list(seen_ids)
     _save_cache(cache)
 
-    LOG.info(f"Normalized {len(normalized)} new jobs (after cache dedup).")
+    LOG.info(f"Normalized {len(normalized)} jobs from query.")
 
     if ingest and normalized:
         client = chroma_helper.init_chroma_client()

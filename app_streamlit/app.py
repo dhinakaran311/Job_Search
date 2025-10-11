@@ -115,62 +115,96 @@ def load_offline_jobs(path="data/sample_jobs.json") -> List[Dict[str, Any]]:
 
 def ingest_jobs(jobs: List[Dict[str, Any]]):
     if not jobs:
+        log("No jobs to ingest")
         return
-    vec = TfidfVectorizer(stop_words="english", max_features=20000)
-    descs = [j["description"] or j["title"] for j in jobs]
-    X = vec.fit_transform(descs)
+    log(f"Ingesting {len(jobs)} jobs...")
+    
+    # Initialize recommender if not already done
+    if "recommender" not in st.session_state:
+        from backend.services.retrieval import TFIDFRecommender
+        st.session_state["recommender"] = TFIDFRecommender()
+    
+    # Fit the recommender with the new jobs
+    st.session_state["recommender"].fit(jobs)
     st.session_state["jobs"] = jobs
-    st.session_state["vectorizer"] = vec
-    st.session_state["job_vectors"] = X
-    # Precompute skills
-    job_sk = {}
-    for j in jobs:
-        job_sk[j["id"]] = extract_skills_service(j["description"], use_llm=False)
-    st.session_state["job_skills"] = job_sk
     log(f"Ingested {len(jobs)} jobs")
 
 # ---------------- Recommendation ----------------
-def recommend(resume_text: str, role: str, top_k=10, use_llm=False):
-    jobs = st.session_state["jobs"]
-    vec = st.session_state["vectorizer"]
-    X = st.session_state["job_vectors"]
-    if not jobs or vec is None or X is None or (issparse(X) and X.shape[0] == 0):
-        log("No jobs ingested")
-        return []
-    rvec = vec.transform([resume_text])
-    sims = linear_kernel(rvec, X).flatten()
-    results = []
-    for idx, j in enumerate(jobs):
-        job_sk = st.session_state["job_skills"].get(j["id"], [])
-        resume_sk = extract_skills_service(resume_text, use_llm=use_llm and bool(OPENAI_KEY))
-        overlap = set(job_sk) & set(resume_sk)
-        missing = list(set(job_sk) - set(resume_sk))
-        overlap_ratio = len(overlap) / len(job_sk) if job_sk else 0
-        score = 0.7 * sims[idx] + 0.3 * overlap_ratio
-        results.append({
-            "job": j,
-            "sim": sims[idx],
-            "job_skills": job_sk,
-            "resume_skills": resume_sk,
-            "overlap": list(overlap),
-            "missing": missing,
-            "score": score
-        })
-    return sorted(results, key=lambda r: r["score"], reverse=True)[:top_k]
+# Initialize TF-IDF recommender in session state
+if "recommender" not in st.session_state:
+    from backend.services.retrieval import TFIDFRecommender, bucketize_recommendations
+    st.session_state["recommender"] = TFIDFRecommender()
 
-def bucketize(results):
-    safe, stretch, fallback = [], [], []
-    for r in results:
-        if r["score"] >= 0.65: safe.append(r)
-        elif r["score"] >= 0.4: stretch.append(r)
-        else: fallback.append(r)
-    return {"Safe": safe, "Stretch": stretch, "Fallback": fallback}
+def recommend(resume_text: str, role: str, top_k: int = 10, use_llm: bool = False) -> List[Dict[str, Any]]:
+    """
+    Get job recommendations using the TF-IDF recommender.
+    
+    Args:
+        resume_text: The resume text to match against jobs
+        role: Target role (not currently used)
+        top_k: Number of results to return
+        use_llm: Whether to use LLM for skill extraction
+        
+    Returns:
+        List of job recommendations with scores and metadata
+    """
+    if not hasattr(st.session_state, "recommender") or not st.session_state.recommender.jobs:
+        log("No jobs ingested - please load jobs first")
+        return []
+        
+    return st.session_state.recommender.recommend(
+        resume_text,
+        top_k=top_k,
+        use_llm=use_llm and bool(OPENAI_KEY)
+    )
+
+def bucketize(results: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Categorize recommendations into buckets based on score thresholds.
+    
+    Args:
+        results: List of recommendation results with 'score' field
+        
+    Returns:
+        Dictionary with keys 'Safe', 'Stretch', 'Fallback' containing matching results
+    """
+    from backend.services.retrieval import bucketize_recommendations
+    return bucketize_recommendations(results)
+
+# Country code mapping
+COUNTRY_CODES = {
+    "United Kingdom": "gb",
+    "United States": "us",
+    "Canada": "ca",
+    "Australia": "au",
+    "India": "in",
+    "Germany": "de",
+    "France": "fr",
+    "Brazil": "br",
+    "Japan": "jp",
+    "Singapore": "sg"
+}
 
 # ---------------- Streamlit UI ----------------
 st.set_page_config(page_title="Job Recommender", layout="wide")
-st.title("Phase 7 — Job Recommender (Streamlit Demo)")
+st.title("Job Search & Recommendation System")
 
 with st.sidebar:
+    st.header("Job Search")
+    search_query = st.text_input("Job title, keywords, or company")
+    location = st.text_input("Location")
+    
+    # Add country selection
+    selected_country = st.selectbox(
+        "Select Country",
+        options=list(COUNTRY_CODES.keys()),
+        index=0,  # Default to first country (UK)
+        help="Select the country for job search"
+    )
+    
+    search_button = st.button("Search Jobs")
+    
+    st.markdown("---")
     st.header("Controls & Ingest")
     st.write("Ollama LLM: enabled (local)")
     st.button("Ingest offline jobs", on_click=lambda: ingest_jobs(load_offline_jobs()))
@@ -190,6 +224,38 @@ with st.sidebar:
     top_k = st.number_input("top-K", 1, 50, 10)
     use_llm = st.checkbox("Use LLM for skills/summaries (Ollama)", value=True)
     st.text_area("Log", "\n".join(st.session_state["log"][-20:]), height=200)
+
+# Handle job search
+if search_button and (search_query or location):
+    with st.spinner("Searching for jobs..."):
+        try:
+            # Get the country code from the selected country name
+            country_code = COUNTRY_CODES.get(selected_country, "gb")  # Default to GB if not found
+            
+            # Convert the search to queries format expected by fetch_jobs_for_queries
+            queries = [{"what": search_query, "where": location}]
+            jobs = fetch_and_ingest(
+                queries, 
+                country=country_code,  # Pass the selected country code
+                pages_per_query=1
+            )
+            
+            if jobs:
+                st.success(f"Found {len(jobs)} jobs in {selected_country}")
+                # Display jobs in a nice format
+                for i, job in enumerate(jobs[:10]):  # Show first 10 jobs
+                    with st.expander(f"{job.get('title', 'No title')} at {job.get('company', 'Unknown company')}"):
+                        st.write(f"**Location:** {job.get('location', 'Not specified')}")
+                        st.write(f"**Posted:** {job.get('created', 'Date not available')}")
+                        st.write(f"**Description:** {job.get('description', 'No description available')[:300]}...")
+                        if job.get('redirect_url'):
+                            st.markdown(f"[View Job]({job['redirect_url']})")
+            else:
+                st.warning(f"No jobs found in {selected_country}. Try different search terms or location.")
+                
+        except Exception as e:
+            st.error(f"Error searching for jobs in {selected_country}: {str(e)}")
+            st.exception(e)
 
 # Main layout
 resume_file = st.file_uploader("Upload resume (pdf/docx/txt/md)")
@@ -228,14 +294,14 @@ if recs:
                     st.write(f"**Location:** {j.get('location','')}")
                     st.write(f"**Posted:** {j.get('posted_at','')}")
                     st.write(f"**URL:** {j.get('url','')}")
-                    st.write(f"**Similarity:** {r['sim']:.3f}")
+                    st.write(f"**Similarity:** {r['similarity']:.3f}")
                     st.write(f"**Job skills:** {', '.join(r['job_skills'])}")
                     st.write(f"**Resume skills:** {', '.join(r['resume_skills'])}")
-                    st.write(f"**Missing skills:** {', '.join(r['missing']) or 'None'}")
+                    st.write(f"**Missing skills:** {', '.join(r['missing_skills']) or 'None'}")
                     if use_llm:
                         st.write("**LLM summary (Ollama):**", job_summary_1line(j["description"]))
                         st.write("**Upskilling plan (Ollama):**")
-                        st.write(upskilling_plan_bulleted(role, r["missing"], context="Candidate resume"))
+                        st.write(upskilling_plan_bulleted(role, r["missing_skills"], context="Candidate resume"))
                     else:
                         st.write("LLM disabled")
 
@@ -248,7 +314,7 @@ if recs:
             "location": j.get("location"), "url": j.get("url"),
             "score": r["score"], "job_skills": ";".join(r["job_skills"]),
             "resume_skills": ";".join(r["resume_skills"]),
-            "missing": ";".join(r["missing"])
+            "missing": ";".join(r["missing_skills"])
         })
     df = pd.DataFrame(rows)
     st.download_button("Export CSV", df.to_csv(index=False), "recs.csv", "text/csv")

@@ -9,8 +9,12 @@ Provides:
 Default model is sentence-transformers/all-MiniLM-L6-v2 (384 dims).
 """
 import os
+import warnings
 from typing import List
 from threading import Lock
+
+# Suppress PyTorch warnings
+warnings.filterwarnings("ignore", message=".*torch.classes.*")
 
 try:
     from sentence_transformers import SentenceTransformer
