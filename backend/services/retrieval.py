@@ -1,71 +1,67 @@
 """
-Retrieval service: embed resume text, query Chroma, compute similarity/overlap,
-and return ranked results with buckets.
-
-Provides:
-- recommend_jobs(resume_text, top_k=10, collection=None, collection_name=None, lexicon=None)
-- small CLI for quick manual tests when run as module.
+Retrieval service: TF-IDF + Skill Match + Experience Match + (optional Chroma)
 """
 
-from typing import List, Dict, Any, Optional, Set, Tuple
+from typing import List, Dict, Any, Optional, Set
 import re
 import os
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import linear_kernel
-from scipy.sparse import issparse
 
+# Chroma DB support (existing functionality)
 from backend.services import embedding as emb_service
 from backend.db import chroma as chroma_helper
+
 from backend.services.ranking import fused_score, bucket_for_score
 from backend.services.skill_extractor import extract_skills as extract_skills_service
 
-# small fallback lexicon (keeps consistent with previous modules)
-DEFAULT_LEXICON = [
-    "python","sql","streamlit","pytorch","tensorflow","keras","scikit-learn",
-    "pandas","numpy","docker","kubernetes","aws","azure","gcp","react","node",
-    "java","javascript","c++","git","linux","spark","hadoop","nlp","cv","flask",
-    "fastapi","rest","graphql"
-]
 
+# ─────────────────────────────────────────────────────────────────────────────
+#                          COMMON UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_LEXICON = [
+    "python", "sql", "streamlit", "pytorch", "tensorflow", "keras", "scikit-learn",
+    "pandas", "numpy", "docker", "kubernetes", "aws", "azure", "gcp", "react", "node",
+    "java", "javascript", "c++", "git", "linux", "spark", "hadoop", "nlp", "cv",
+    "flask", "fastapi", "rest", "graphql"
+]
 
 def _safe_unwrap(resp: Any, key: str) -> List:
     """
-    Extract key results from Chroma query response.
-    Handles both new dict (values are lists-of-lists) and older list-of-dict formats.
+    Extract values safely from response returned by Chroma DB.
+    Handles list/dict formats.
     """
     if isinstance(resp, dict) and key in resp:
         val = resp[key]
-        # typical format: val = [[...]] for single query -> return inner list
-        if isinstance(val, list) and len(val) > 0 and isinstance(val[0], list):
+        if isinstance(val, list) and isinstance(val[0], list):
             return val[0]
         return val
-    if isinstance(resp, list) and len(resp) > 0 and isinstance(resp[0], dict):
+
+    if isinstance(resp, list) and isinstance(resp[0], dict):
         return resp[0].get(key, [])
+
     return []
 
 
-def _parse_skills_from_metadata(metadata: Dict[str, Any], description: str = "", lexicon: Optional[List[str]] = None) -> Set[str]:
-    """Return a set of normalized skills from metadata['skills'] or by scanning description."""
+def _parse_skills_from_metadata(metadata: Dict[str, Any], description: str = "",
+                                lexicon: Optional[List[str]] = None) -> Set[str]:
+    """Extract skills from metadata or job description."""
     lex = set([s.lower() for s in (lexicon or DEFAULT_LEXICON)])
-    skills_raw = metadata.get("skills") if metadata else None
-
     skills_set = set()
 
-    # Accept lists or comma-separated strings
-    if isinstance(skills_raw, list):
-        for s in skills_raw:
-            if not s:
-                continue
-            skills_set.add(str(s).strip().lower())
-    elif isinstance(skills_raw, str) and skills_raw.strip():
-        # split on comma or semicolon
-        parts = re.split(r"[;,]\s*|\s+\|\s+|\s+/\s+", skills_raw)
-        for p in parts:
-            p_s = p.strip().lower()
-            if p_s:
-                skills_set.add(p_s)
+    raw = metadata.get("skills") if metadata else None
 
-    # Fallback: pattern-based detection from description if no skills found
+    if isinstance(raw, list):
+        skills_set.update([str(x).lower().strip() for x in raw])
+
+    elif isinstance(raw, str):
+        for p in re.split(r"[;,/|]", raw):
+            p = p.strip().lower()
+            if p:
+                skills_set.add(p)
+
+    # fallback: detect skills from description text
     if not skills_set and description:
         txt = description.lower()
         for term in lex:
@@ -75,256 +71,171 @@ def _parse_skills_from_metadata(metadata: Dict[str, Any], description: str = "",
     return skills_set
 
 
-def _distance_to_similarity(distance: Optional[float]) -> Optional[float]:
-    """
-    Convert a chroma distance to similarity in [0,1].
-    We use similarity = 1 - distance and clamp.
-    If distance is None or not numeric, return None.
-    """
+def _distance_to_similarity(distance: Optional[float]) -> float:
+    """Convert Chroma DB distance into similarity [0-1]"""
     if distance is None:
-        return None
+        return 0.0
+
     try:
-        sim = 1.0 - float(distance)
-    except Exception:
-        return None
-    # clamp
-    if sim < 0.0:
-        sim = 0.0
-    if sim > 1.0:
-        sim = 1.0
-    return sim
+        sim = 1 - float(distance)
+        return max(0.0, min(sim, 1.0))
+    except:
+        return 0.0
 
 
-def recommend_jobs(
+
+# ─────────────────────────────────────────────────────────────────────────────
+#                          CHROMA BASED RECOMMENDATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def recommend(
+    self,
     resume_text: str,
+    candidate_exp: int = 0,
     top_k: int = 10,
-    collection=None,
-    collection_name: Optional[str] = None,
-    lexicon: Optional[List[str]] = None,
+    role_filter: Optional[str] = None,  # ✅ New parameter
+    use_llm: bool = False
 ) -> List[Dict[str, Any]]:
     """
-    Main function that takes resume text and returns top_k ranked job matches.
-
-    Returns a list of dicts with fields:
-    { id, title, company, url, similarity, skill_overlap, score, bucket, missing_skills, metadata, document }
+    Recommend jobs based on TF-IDF + skill match + experience + role filtering
     """
+    if not self.jobs or self.job_vectors is None:
+        return []
 
-    if not resume_text or not resume_text.strip():
-        raise ValueError("resume_text must be a non-empty string")
+    # Convert resume to TF-IDF vector
+    query_vector = self.vectorizer.transform([resume_text])
 
-    # Ensure we have a collection
-    if collection is None:
-        client = chroma_helper.init_chroma_client()
-        collection = chroma_helper.get_or_create_collection(collection_name=collection_name, client=client)
+    # Calculate similarity scores
+    similarity_scores = linear_kernel(query_vector, self.job_vectors).flatten()
 
-    # 1) embed resume
-    q_vec = emb_service.embed_text(resume_text)
+    # Extract skills from resume
+    resume_skills = extract_skills_service(resume_text, use_llm=use_llm)
 
-    # 2) query chroma
-    try:
-        resp = collection.query(query_embeddings=[q_vec], n_results=top_k, include=["metadatas", "documents", "distances"])
-    except TypeError:
-        # older versions may not support include list exactly; try without include
-        resp = collection.query(query_embeddings=[q_vec], n_results=top_k)
+    # ✅ ROLE FILTER STEP
+    filtered_jobs = []
+    for idx, job in enumerate(self.jobs):
 
-    # 3) unwrap response
-    ids = _safe_unwrap(resp, "ids")
-    metadatas = _safe_unwrap(resp, "metadatas")
-    docs = _safe_unwrap(resp, "documents")
-    distances = _safe_unwrap(resp, "distances")
+        if role_filter:
+            title = job.get("title", "").lower()
+            role_filter_lower = role_filter.lower()
 
-    # 4) build user skills via lexicon extraction (simple)
-    resume_txt = resume_text.lower()
-    lex = set([s.lower() for s in (lexicon or DEFAULT_LEXICON)])
-    user_skills = set([term for term in lex if re.search(r"\b" + re.escape(term) + r"\b", resume_txt)])
+            if role_filter_lower not in title:
+                continue   # skip jobs that don’t match the role
+
+        filtered_jobs.append((idx, job))
+
+    # If no jobs matched filtering, fallback to ALL jobs
+    if not filtered_jobs:
+        filtered_jobs = list(enumerate(self.jobs))
 
     results = []
-    n = max(len(ids), len(metadatas), len(docs), len(distances))
-    for i in range(n):
-        job_id = ids[i] if i < len(ids) else None
-        metadata = metadatas[i] if i < len(metadatas) else {}
-        document = docs[i] if i < len(docs) else ""
-        distance = distances[i] if i < len(distances) else None
+    for idx, job in filtered_jobs:
+        job_skills = self.job_skills.get(job["id"], [])
 
-        # Parse job skills
-        job_skills = _parse_skills_from_metadata(metadata or {}, document or "", lexicon=lexicon)
-        # Compute overlap
-        overlap = 0.0
-        if job_skills:
-            overlap = len(job_skills.intersection(user_skills)) / max(1, len(job_skills))
-        else:
-            overlap = 0.0
+        matched = set(job_skills) & set(resume_skills)
+        missing = set(job_skills) - set(resume_skills)
 
-        similarity = _distance_to_similarity(distance)
-        if similarity is None:
-            # As a fallback, set similarity to 0
-            similarity = 0.0
+        skill_score = len(matched) / max(len(job_skills), 1)
 
-        score = fused_score(similarity, overlap)
-        bucket = bucket_for_score(score)
-        missing_skills = sorted(list(job_skills.difference(user_skills)))
+        job_exp = int(job.get("experience", 0))
+        exp_score = min(candidate_exp / job_exp, 1) if job_exp > 0 else 1
 
-        result = {
-            "id": job_id,
-            "title": (metadata or {}).get("title") if metadata else None,
-            "company": (metadata or {}).get("company") if metadata else None,
-            "url": (metadata or {}).get("url") if metadata else None,
-            "similarity": similarity,
-            "skill_overlap": overlap,
-            "score": score,
-            "bucket": bucket,
-            "missing_skills": missing_skills,
-            "metadata": metadata,
-            "document": document
-        }
-        results.append(result)
+        # Final score
+        final_score = (similarity_scores[idx] * 0.4) + (skill_score * 0.4) + (exp_score * 0.2)
 
-    # sort by score desc
-    results = sorted(results, key=lambda x: x["score"], reverse=True)
-    return results
+        results.append({
+            "job": job,
+            "similarity": float(similarity_scores[idx]),
+            "skill_score": round(skill_score, 3),
+            "experience_score": round(exp_score, 3),
+            "score": round(final_score, 3),
+            "matched_skills": list(matched),
+            "missing_skills": list(missing),
+            "job_skills": job_skills,
+            "resume_skills": resume_skills,
+            "required_experience": job_exp,
+            "candidate_experience": candidate_exp,
+        })
 
+    # Sort by best score
+    return sorted(results, key=lambda x: x["score"], reverse=True)[:top_k]
+
+# ─────────────────────────────────────────────────────────────────────────────
+#                        TF-IDF EXPERIENCE + SKILL RECOMMENDER
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TFIDFRecommender:
-    """
-    TF-IDF based job recommender that finds similar jobs based on text content.
-    """
+    """Matches job based on TF-IDF + Skill Match + Experience Match"""
+
     def __init__(self):
-        self.vectorizer = TfidfVectorizer(stop_words='english')
+        self.vectorizer = TfidfVectorizer(stop_words="english")
         self.job_vectors = None
         self.jobs = []
         self.job_skills = {}
-    
+
     def fit(self, jobs: List[Dict[str, Any]]) -> None:
-        """
-        Fit the TF-IDF vectorizer on job descriptions.
-        
-        Args:
-            jobs: List of job dictionaries with 'description' and 'id' fields
-        """
+        """Store job vectors and extract job skills"""
         self.jobs = jobs
-        descriptions = [j.get("description", "") or j.get("title", "") for j in jobs]
+        descriptions = [j.get("description", "") for j in jobs]
         self.job_vectors = self.vectorizer.fit_transform(descriptions)
-        
-        # Precompute skills for each job
-        self.job_skills = {}
-        for job in jobs:
-            self.job_skills[job["id"]] = extract_skills_service(
-                job.get("description", "") or job.get("title", ""), 
-                use_llm=False
-            )
-    
+
+        for j in jobs:
+            self.job_skills[j["id"]] = extract_skills_service(j["description"], use_llm=False)
+
     def recommend(
-        self, 
-        query_text: str, 
-        top_k: int = 10, 
-        use_llm: bool = False
+        self, resume_text: str, candidate_exp: int = 0, top_k: int = 10, use_llm: bool = False
     ) -> List[Dict[str, Any]]:
-        """
-        Find similar jobs based on text similarity and skill overlap.
-        
-        Args:
-            query_text: Text to find similar jobs for (e.g., resume text)
-            top_k: Number of results to return
-            use_llm: Whether to use LLM for skill extraction
-            
-        Returns:
-            List of result dictionaries with job info and match scores
-        """
-        if not self.jobs or self.job_vectors is None:
-            return []
-            
-        # Transform query to TF-IDF vector
-        query_vector = self.vectorizer.transform([query_text])
-        
-        # Calculate cosine similarities
-        similarities = linear_kernel(query_vector, self.job_vectors).flatten()
-        
-        # Extract skills from query text
-        query_skills = extract_skills_service(query_text, use_llm=use_llm)
-        
+
+        query_vector = self.vectorizer.transform([resume_text])
+        similarity_scores = linear_kernel(query_vector, self.job_vectors).flatten()
+
+        resume_skills = extract_skills_service(resume_text, use_llm=use_llm)
+
         results = []
         for idx, job in enumerate(self.jobs):
-            job_skills = self.job_skills.get(job["id"], [])
-            
-            # Calculate skill overlap
-            overlap = set(job_skills) & set(query_skills)
-            missing_skills = list(set(job_skills) - set(query_skills))
-            
-            # Calculate overlap ratio (handle division by zero)
-            overlap_ratio = len(overlap) / len(job_skills) if job_skills else 0
-            
-            # Combined score (70% similarity, 30% skill overlap)
-            score = 0.7 * similarities[idx] + 0.3 * overlap_ratio
-            
-            results.append({
-                "job": job,
-                "similarity": float(similarities[idx]),
-                "job_skills": job_skills,
-                "resume_skills": query_skills,
-                "overlap": list(overlap),
-                "missing_skills": missing_skills,
-                "score": float(score)
-            })
-        
-        # Sort by score in descending order
+
+            job_skill_list = self.job_skills.get(job["id"], [])
+
+            matched = set(job_skill_list) & set(resume_skills)
+            missing = set(job_skill_list) - set(resume_skills)
+            skill_score = len(matched) / max(len(job_skill_list), 1)
+
+            job_exp = int(job.get("experience", 0))
+            exp_score = min(candidate_exp / job_exp, 1) if job_exp > 0 else 1
+
+            final_score = (similarity_scores[idx] * 0.5) + (skill_score * 0.3) + (exp_score * 0.2)
+
+            results.append(
+                {
+                    "job": job,
+                    "similarity": float(similarity_scores[idx]),
+                    "skill_score": round(skill_score, 3),
+                    "experience_score": round(exp_score, 3),
+                    "score": round(final_score, 3),
+
+                    "matched_skills": list(matched),
+                    "missing_skills": list(missing),
+                    "job_skills": job_skill_list,
+                    "resume_skills": resume_skills,
+                    "required_experience": job_exp,
+                    "candidate_experience": candidate_exp,
+                }
+            )
+
         return sorted(results, key=lambda x: x["score"], reverse=True)[:top_k]
 
 
+
 def bucketize_recommendations(results: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Categorize recommendations into buckets based on score thresholds.
-    
-    Args:
-        results: List of recommendation results with 'score' field
-        
-    Returns:
-        Dictionary with keys 'Safe', 'Stretch', 'Fallback' containing matching results
-    """
-    buckets = {
-        "Safe": [],
-        "Stretch": [],
-        "Fallback": []
-    }
-    
-    for result in results:
-        score = result.get("score", 0)
-        if score >= 0.65:
-            buckets["Safe"].append(result)
-        elif score >= 0.4:
-            buckets["Stretch"].append(result)
+    """Group results by difficulty levels for UI"""
+    buckets = {"Safe": [], "Stretch": [], "Fallback": []}
+
+    for r in results:
+        if r["score"] >= 0.70:
+            buckets["Safe"].append(r)
+        elif r["score"] >= 0.45:
+            buckets["Stretch"].append(r)
         else:
-            buckets["Fallback"].append(result)
-            
+            buckets["Fallback"].append(r)
+
     return buckets
-
-
-# Simple CLI for manual testing
-if __name__ == "__main__":
-    import argparse, json
-    parser = argparse.ArgumentParser(description="Recommend jobs from resume text using Chroma.")
-    parser.add_argument("--resume_text", type=str, default=None, help="Resume text (pass directly)")
-    parser.add_argument("--resume_file", type=str, default=None, help="Path to resume text file")
-    parser.add_argument("--top_k", type=int, default=5, help="Number of results to return")
-    parser.add_argument("--collection", type=str, default=None, help="Chroma collection name (optional)")
-    args = parser.parse_args()
-
-    if args.resume_file:
-        if not os.path.exists(args.resume_file):
-            print("Resume file not found:", args.resume_file)
-            raise SystemExit(1)
-
-        # If PDF or DOCX, use resume_parser
-        ext = os.path.splitext(args.resume_file)[1].lower()
-        if ext in [".pdf", ".docx", ".doc"]:
-            from backend.ingestion import resume_parser
-            resume = resume_parser.parse_resume_file(args.resume_file)
-        else:
-            # plain text
-            resume = open(args.resume_file, "r", encoding="utf-8").read()
-
-
-
-    client = chroma_helper.init_chroma_client()
-    collection = chroma_helper.get_or_create_collection(collection_name=args.collection, client=client)
-    recs = recommend_jobs(resume, top_k=args.top_k, collection=collection)
-    print(json.dumps(recs[:args.top_k], indent=2, ensure_ascii=False))
