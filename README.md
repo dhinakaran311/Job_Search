@@ -1,5 +1,7 @@
 # Job Search & Recommendation System
 
+![Job Search Application](job%20search.png)
+
 An intelligent job recommender system that matches candidates to suitable job opportunities using advanced natural language processing, skill extraction, and machine learning techniques. The system provides personalized job recommendations with skill gap analysis and upskilling plans.
 
 ## Table of Contents
@@ -477,6 +479,4 @@ This project is open source. Please refer to the repository for license informat
 - [OpenAI](https://openai.com/) - LLM API provider
 - [sentence-transformers](https://www.sbert.net/) - Embedding models
 
-## Support
-
-For issues, questions, or contributions, please open an issue on the GitHub repository.
+## SupportFor issues, questions, or contributions, please open an issue on the GitHub repository.
